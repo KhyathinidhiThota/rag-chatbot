@@ -60,6 +60,7 @@ async def chat(session_id: str = Form(...), message: str = Form(...)):
 
     return {"answer": answer, "citations": citations}
 
+    
 # -------------------- Get chat history --------------------
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str):
