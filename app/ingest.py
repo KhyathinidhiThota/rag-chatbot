@@ -1,48 +1,75 @@
-import os
-import hashlib
-import PyPDF2
+import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
-from chromadb import PersistentClient
-from app.config import VECTOR_DB_PATH, EMBEDDING_MODEL
+from PyPDF2 import PdfReader
 
-os.makedirs(VECTOR_DB_PATH, exist_ok=True)
+# 🔹 Embedding model
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-def load_pdf(file_path: str):
-    text_data = []
-    with open(file_path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text()
-            if text:
-                text_data.append({"page": i+1, "text": text})
-    return text_data
+# 🔹 FAISS index for cosine similarity
+dimension = embedder.get_sentence_embedding_dimension()
+index = faiss.IndexFlatIP(dimension)
 
-def chunk_text(text, chunk_size=800, overlap=120):
+# 🔹 Store documents as dicts {text, file, page}
+documents = []
+
+def load_pdf(file_path: str) -> str:
+    """Extract text from a PDF file."""
+    text = ""
+    reader = PdfReader(file_path)
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text.strip()
+
+def chunk_text(text, file, page, chunk_size=150, overlap=30):
+    """Split text into overlapping chunks for better retrieval."""
     words = text.split()
     chunks = []
     for i in range(0, len(words), chunk_size - overlap):
         chunk = " ".join(words[i:i+chunk_size])
-        chunks.append(chunk)
+        if chunk.strip():
+            chunks.append({"text": chunk, "file": file, "page": page})
     return chunks
 
-def ingest_pdf(file_path: str, chunk_size=800, overlap=120):
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    client = PersistentClient(path=VECTOR_DB_PATH)
-    collection = client.get_or_create_collection("documents")
+def ingest_pdf(file_path: str):
+    """Read, chunk, embed, and store a PDF in FAISS index."""
+    global documents, index
+    text = load_pdf(file_path)
+    if not text:
+        return "No text found in PDF."
 
-    pdf_text = load_pdf(file_path)
-    total_chunks = 0
-    for entry in pdf_text:
-        chunks = chunk_text(entry["text"], chunk_size, overlap)
-        embeddings = model.encode(chunks).tolist()
-        total_chunks += len(chunks)
-        for chunk, emb in zip(chunks, embeddings):
-            chunk_id = hashlib.md5(chunk.encode()).hexdigest()
-            collection.add(
-                documents=[chunk],
-                embeddings=[emb],
-                metadatas=[{"file": os.path.basename(file_path), "page": entry["page"]}],
-                ids=[f"{os.path.basename(file_path)}_p{entry['page']}_{chunk_id}"]
-            )
+    # Reset FAISS index & documents when re-ingesting
+    index.reset()
+    documents.clear()
 
-    return {"status": "success", "file": file_path, "chunks": total_chunks}
+    # Extract all pages
+    all_chunks = []
+    reader = PdfReader(file_path)
+    for page_num, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        chunks = chunk_text(page_text, file=file_path, page=page_num)
+        all_chunks.extend(chunks)
+
+    if not all_chunks:
+        return "No chunks could be created from PDF."
+
+    # Encode & add to FAISS
+    embeddings = embedder.encode([c["text"] for c in all_chunks], normalize_embeddings=True)
+    index.add(np.array(embeddings, dtype=np.float32))
+    documents.extend(all_chunks)
+
+    return f"Ingested {len(all_chunks)} chunks from {file_path}"
+
+def retrieve(query: str, top_k: int = 3):
+    """Retrieve top-k most relevant chunks for a query."""
+    if not documents:
+        return []
+
+    query_vec = embedder.encode([query], normalize_embeddings=True)
+    distances, indices = index.search(np.array(query_vec, dtype=np.float32), top_k)
+
+    results = []
+    for idx in indices[0]:
+        if 0 <= idx < len(documents):
+            results.append(documents[idx])
+    return results
